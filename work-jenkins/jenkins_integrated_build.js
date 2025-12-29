@@ -23,54 +23,48 @@
     const DEFAULT_CONFIG = {
         triggerMaxRetries: 3,
         triggerRetryDelay: 2000,
+        displayOrder: ['common', 'api', 'web', 'bill', 'customer', 'system', 'report'],
         jobs: {
             'common': {
                 name: 'Common',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-common/build?delay=0sec',
                 enabled: true,
-                stage: 1,  // 构建阶段：第1步
                 wait: true // 是否等待构建完成
             },
             'api': {
                 name: 'API',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-api/build?delay=0sec',
                 enabled: true,
-                stage: 1,
                 wait: true
             },
             'web': {
                 name: 'Web',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-web/build?delay=0sec',
                 enabled: true,
-                stage: 1,
                 wait: false // web不等待
             },
             'bill': {
                 name: 'Bill Service',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-bill-service/build?delay=0sec',
                 enabled: true,
-                stage: 2,  // 第2步执行
                 wait: false
             },
             'customer': {
                 name: 'Customer Service',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-customer-service/build?delay=0sec',
                 enabled: true,
-                stage: 2,
                 wait: false
             },
             'system': {
                 name: 'System Service',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-system-service/build?delay=0sec',
                 enabled: true,
-                stage: 2,
                 wait: false
             },
             'report': {
                 name: 'Report Service',
                 url: 'http://10.9.31.83:9001/job/sz-newcis-dev/job/sz-newcis-dev_cis-report-service/build?delay=0sec',
                 enabled: true,
-                stage: 2,
                 wait: false
             }
         }
@@ -85,6 +79,52 @@
 
     // Job 定义
     let JOB_DEFINITIONS = CONFIG.jobs;
+    let LAST_SCANNED_JOBS = [];
+    let DISPLAY_ORDER = CONFIG.displayOrder || [];
+
+    // 统一布尔与阶段等字段，防止旧版本字符串/数字造成显示与逻辑错误
+    function sanitizeJob(job) {
+        const normalizeBool = (val, defaultVal = true) => {
+            if (val === undefined || val === null) return defaultVal;
+            if (typeof val === 'string') {
+                const lowered = val.toLowerCase();
+                if (['false', '0', 'no', 'off'].includes(lowered)) return false;
+                if (['true', '1', 'yes', 'on'].includes(lowered)) return true;
+            }
+            return Boolean(val);
+        };
+
+        const normalized = { ...job };
+        normalized.enabled = normalizeBool(job.enabled, true);
+        normalized.wait = normalizeBool(job.wait, true);
+        return normalized;
+    }
+
+    function sanitizeAllJobs(jobsObj) {
+        const newJobs = {};
+        for (const [key, job] of Object.entries(jobsObj || {})) {
+            newJobs[key] = sanitizeJob(job);
+        }
+        return newJobs;
+    }
+
+    function sanitizeDisplayOrder(orderArr, jobsObj) {
+        const keys = new Set(Object.keys(jobsObj || {}));
+        const result = [];
+        (orderArr || []).forEach(k => { if (keys.has(k)) result.push(k); });
+        // append missing keys at the end to keep stability
+        for (const k of keys) {
+            if (!result.includes(k)) result.push(k);
+        }
+        return result;
+    }
+
+    // 统一同步展示顺序到全局变量与配置
+    function syncDisplayOrder() {
+        CONFIG.displayOrder = sanitizeDisplayOrder(CONFIG.displayOrder, CONFIG.jobs);
+        DISPLAY_ORDER = CONFIG.displayOrder;
+        return DISPLAY_ORDER;
+    }
 
     // 立即加载配置
     (function earlyLoadConfig() {
@@ -94,9 +134,12 @@
                 if (savedConfig) {
                     const parsedConfig = JSON.parse(savedConfig);
                     CONFIG = JSON.parse(JSON.stringify({ ...DEFAULT_CONFIG, ...parsedConfig }));
-                    TRIGGER_MAX_RETRIES = CONFIG.triggerMaxRetries;
-                    TRIGGER_RETRY_DELAY = CONFIG.triggerRetryDelay;
-                    JOB_DEFINITIONS = CONFIG.jobs;
+            CONFIG.jobs = sanitizeAllJobs(CONFIG.jobs);
+            CONFIG.displayOrder = sanitizeDisplayOrder(CONFIG.displayOrder, CONFIG.jobs);
+            TRIGGER_MAX_RETRIES = CONFIG.triggerMaxRetries;
+            TRIGGER_RETRY_DELAY = CONFIG.triggerRetryDelay;
+            JOB_DEFINITIONS = CONFIG.jobs;
+            DISPLAY_ORDER = CONFIG.displayOrder;
                     console.log('配置预加载成功:', CONFIG);
                 }
             }
@@ -109,29 +152,132 @@
      * 🆕 动态构建流水线步骤 (从Job配置中生成)
      * @returns {Array} 流水线步骤数组
      */
-    function buildPipelineSteps() {
-        // 按 stage 分组
-        const stageMap = new Map();
+    function getOrderedJobEntries() {
+        const jobs = sanitizeAllJobs(JOB_DEFINITIONS);
+        const order = sanitizeDisplayOrder(DISPLAY_ORDER, jobs);
+        return order.map(key => [key, jobs[key]]).filter(([, job]) => job);
+    }
 
-        for (const [key, job] of Object.entries(JOB_DEFINITIONS)) {
-            if (!job.enabled) continue; // 跳过禁用的Job
+    function moveDisplayOrder(key, direction) {
+        const idx = DISPLAY_ORDER.indexOf(key);
+        if (idx === -1) return;
+        const swapIdx = idx + direction;
+        if (swapIdx < 0 || swapIdx >= DISPLAY_ORDER.length) return;
+        const newOrder = [...DISPLAY_ORDER];
+        [newOrder[idx], newOrder[swapIdx]] = [newOrder[swapIdx], newOrder[idx]];
+        DISPLAY_ORDER = newOrder;
+        CONFIG.displayOrder = newOrder;
+        renderJobList();
+        renderOrderList();
+    }
 
-            const stage = job.stage || 1; // 默认第1步
-            if (!stageMap.has(stage)) {
-                stageMap.set(stage, []);
+    async function copyTextToClipboard(text) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
             }
-            stageMap.get(stage).push({
-                key: key,
-                wait: job.wait !== undefined ? job.wait : true // 默认等待
-            });
+        } catch (_) { /* ignore and fallback */ }
+
+        // fallback
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            return ok;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function exportConfigToClipboard() {
+        syncDisplayOrder();
+        const payload = {
+            triggerMaxRetries: CONFIG.triggerMaxRetries,
+            triggerRetryDelay: CONFIG.triggerRetryDelay,
+            displayOrder: CONFIG.displayOrder,
+            jobs: CONFIG.jobs
+        };
+        const json = JSON.stringify(payload, null, 2);
+        copyTextToClipboard(json).then((ok) => {
+            if (ok) {
+                alert('✅ 配置已导出到剪贴板！');
+            } else {
+                const manual = prompt('剪贴板不可用，请手动复制 JSON：', json);
+                if (manual !== null) alert('请手动复制提示框中的 JSON。');
+            }
+        }).catch(() => {
+            const manual = prompt('剪贴板不可用，请手动复制 JSON：', json);
+            if (manual !== null) alert('请手动复制提示框中的 JSON。');
+        });
+    }
+
+    async function importConfigFromClipboard() {
+        try {
+            let text = '';
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                text = await navigator.clipboard.readText();
+            } else {
+                text = prompt('请输入配置 JSON：', '');
+                if (text === null) return;
+            }
+            if (!text || !text.trim()) {
+                alert('未获取到内容');
+                return;
+            }
+            const parsed = JSON.parse(text);
+            if (!parsed.jobs || typeof parsed.jobs !== 'object') {
+                alert('JSON 无效：缺少 jobs 字段');
+                return;
+            }
+            CONFIG.jobs = sanitizeAllJobs(parsed.jobs);
+            CONFIG.displayOrder = sanitizeDisplayOrder(parsed.displayOrder || [], CONFIG.jobs);
+            DISPLAY_ORDER = CONFIG.displayOrder;
+            CONFIG.triggerMaxRetries = parsed.triggerMaxRetries || CONFIG.triggerMaxRetries;
+            CONFIG.triggerRetryDelay = parsed.triggerRetryDelay || CONFIG.triggerRetryDelay;
+            TRIGGER_MAX_RETRIES = CONFIG.triggerMaxRetries;
+            TRIGGER_RETRY_DELAY = CONFIG.triggerRetryDelay;
+            JOB_DEFINITIONS = CONFIG.jobs;
+            syncDisplayOrder();
+            renderJobList();
+            rerenderImportList();
+            renderOrderList();
+            saveConfig();
+            alert('✅ 配置已导入并保存！');
+        } catch (err) {
+            alert('导入失败：' + err.message);
+            console.error('导入配置失败', err);
+        }
+    }
+
+    function buildPipelineSteps() {
+        // 使用“优先”(wait=true) 分两批执行，按展示顺序排列
+        const priorityJobs = [];
+        const normalJobs = [];
+
+        for (const [key, job] of getOrderedJobEntries()) {
+            if (!job.enabled) continue; // 跳过禁用的Job
+            const jobEntry = {
+                key,
+                wait: job.wait !== undefined ? job.wait : true // wait 仍表示是否阻塞等待
+            };
+            if (job.wait !== false) {
+                priorityJobs.push(jobEntry);
+            } else {
+                normalJobs.push(jobEntry);
+            }
         }
 
-        // 按 stage 顺序生成步骤
-        const stages = Array.from(stageMap.keys()).sort((a, b) => a - b);
-        const pipelineSteps = stages.map(stage => ({
-            type: 'parallel-wait',
-            jobs: stageMap.get(stage)
-        }));
+        const pipelineSteps = [];
+        if (priorityJobs.length) {
+            pipelineSteps.push({ type: 'parallel-wait', jobs: priorityJobs });
+        }
+        if (normalJobs.length) {
+            pipelineSteps.push({ type: 'parallel-wait', jobs: normalJobs });
+        }
 
         console.log('动态生成的流水线步骤:', pipelineSteps);
         return pipelineSteps;
@@ -189,54 +335,6 @@
         return jobs;
     }
 
-    /**
-     * 检查Job是否存在(通过API)
-     * @param {string} jobUrl - Job的URL
-     * @returns {Promise<boolean>}
-     */
-    async function checkJobExists(jobUrl) {
-        try {
-            // 提取job路径并检查
-            const jobPath = jobUrl.split('/build?')[0];
-            const apiUrl = `${jobPath}/api/json`;
-
-            const response = await fetch(apiUrl, {
-                method: 'GET',
-                headers: {
-                    'Accept': 'application/json'
-                }
-            });
-
-            return response.ok;
-        } catch (error) {
-            console.warn('检查Job存在性失败:', error);
-            return false;
-        }
-    }
-
-    /**
-     * 批量检查所有已配置Job的存在性
-     * @returns {Promise<Object>} {key: boolean}
-     */
-    async function validateAllJobs() {
-        const results = {};
-        const checkPromises = [];
-
-        for (const [key, job] of Object.entries(JOB_DEFINITIONS)) {
-            checkPromises.push(
-                checkJobExists(job.url).then(exists => {
-                    results[key] = exists;
-                    if (!exists) {
-                        console.warn(`⚠️ Job "${job.name}" (${key}) 不存在或无法访问`);
-                    }
-                })
-            );
-        }
-
-        await Promise.all(checkPromises);
-        return results;
-    }
-
     // =================================================================
     // 🔚 [新增功能结束]
     // =================================================================
@@ -269,7 +367,10 @@
 
                 TRIGGER_MAX_RETRIES = CONFIG.triggerMaxRetries;
                 TRIGGER_RETRY_DELAY = CONFIG.triggerRetryDelay;
+                CONFIG.jobs = sanitizeAllJobs(CONFIG.jobs);
+                CONFIG.displayOrder = sanitizeDisplayOrder(CONFIG.displayOrder, CONFIG.jobs);
                 JOB_DEFINITIONS = CONFIG.jobs;
+                DISPLAY_ORDER = CONFIG.displayOrder;
                 console.log('配置保存并验证成功:', CONFIG);
                 return true;
             } else {
@@ -302,6 +403,7 @@
                     <div class="gm-settings-nav">
                         <div class="gm-settings-nav-item active" data-tab="basic">基础配置</div>
                         <div class="gm-settings-nav-item" data-tab="jobs">Job配置</div>
+                        <div class="gm-settings-nav-item" data-tab="order">展示顺序</div>
                         <div class="gm-settings-nav-item" data-tab="import">导入管理</div>
                     </div>
 
@@ -328,6 +430,18 @@
                             </div>
                         </div>
 
+                        <!-- 展示顺序标签 -->
+                        <div class="gm-settings-content-tab" data-tab-content="order">
+                            <div class="gm-config-section">
+                                <div style="margin-bottom: 8px;">
+                                    <strong>排序启用的服务 (用于展示):</strong>
+                                    <span id="gm-order-count" style="color:#17a2b8;"></span>
+                                </div>
+                                <div id="gm-order-list" class="gm-order-list" style="max-height: 400px; overflow-y: auto;"></div>
+                                <div class="gm-order-hint">仅显示已启用的 Job，可上下调整展示顺序。</div>
+                            </div>
+                        </div>
+
                         <!-- 导入管理标签 -->
                         <div class="gm-settings-content-tab" data-tab-content="import">
                             <div class="gm-config-section">
@@ -335,8 +449,17 @@
                                     <button id="gm-import-scan" class="gm-action-btn gm-btn-scan">
                                         🔍 扫描页面Job
                                     </button>
-                                    <button id="gm-import-validate" class="gm-action-btn gm-btn-validate">
-                                        ✅ 验证所有Job
+                                    <label class="gm-import-toggle">
+                                        <input type="checkbox" id="gm-import-show-existing" />
+                                        显示已在配置的 Job
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 12px;">
+                                    <button id="gm-import-export" class="gm-action-btn gm-btn-export">
+                                        ⬆️ 导出配置(JSON)
+                                    </button>
+                                    <button id="gm-import-import" class="gm-action-btn gm-btn-import">
+                                        ⬇️ 导入配置(JSON)
                                     </button>
                                 </div>
                                 <div id="gm-import-list" style="display: none;">
@@ -344,7 +467,7 @@
                                         <strong>可用的Job项目:</strong>
                                         <span id="gm-import-count" style="color: #007bff;"></span>
                                     </div>
-                                    <div id="gm-import-items" style="max-height: 400px; overflow-y: auto;"></div>
+                                    <div id="gm-import-items" style="max-height: 550px; overflow-y: auto;"></div>
                                 </div>
                             </div>
                         </div>
@@ -367,7 +490,9 @@
 
         // 🆕 导入功能事件
         document.getElementById('gm-import-scan').onclick = scanAndShowJobs;
-        document.getElementById('gm-import-validate').onclick = validateJobs;
+        document.getElementById('gm-import-show-existing').onchange = rerenderImportList;
+        document.getElementById('gm-import-export').onclick = exportConfigToClipboard;
+        document.getElementById('gm-import-import').onclick = importConfigFromClipboard;
 
         // 🆕 标签切换事件
         const navItems = document.querySelectorAll('.gm-settings-nav-item');
@@ -389,12 +514,32 @@
                         tab.classList.remove('active');
                     }
                 });
+
+                // 进入导入管理时自动扫描一次
+                if (targetTab === 'import') {
+                    if (LAST_SCANNED_JOBS.length === 0) {
+                        scanAndShowJobs();
+                    } else {
+                        rerenderImportList();
+                    }
+                }
             };
         });
 
         overlay.onclick = (e) => {
             if (e.target === overlay) closeConfig();
         };
+
+        // 绑定排序按钮事件（事件委托）
+        document.addEventListener('click', (e) => {
+            const upBtn = e.target.closest('.gm-order-up');
+            const downBtn = e.target.closest('.gm-order-down');
+            if (upBtn) {
+                moveDisplayOrder(upBtn.getAttribute('data-key'), -1);
+            } else if (downBtn) {
+                moveDisplayOrder(downBtn.getAttribute('data-key'), 1);
+            }
+        });
     }
 
     /**
@@ -403,51 +548,70 @@
     function scanAndShowJobs() {
         const jobs = extractJobsFromPage();
         const importList = document.getElementById('gm-import-list');
-        const importItems = document.getElementById('gm-import-items');
-        const importCount = document.getElementById('gm-import-count');
-
         if (jobs.length === 0) {
             alert('未在页面中找到可用的Job项目！');
             return;
         }
-
-        importCount.textContent = `(共 ${jobs.length} 个)`;
-        importItems.innerHTML = '';
+        LAST_SCANNED_JOBS = jobs;
         importList.style.display = 'block';
+        rerenderImportList();
+    }
 
-        jobs.forEach(job => {
+    /**
+     * 🆕 根据选择框过滤并渲染导入列表
+     */
+    function rerenderImportList() {
+        const importItems = document.getElementById('gm-import-items');
+        const importCount = document.getElementById('gm-import-count');
+        const showExisting = document.getElementById('gm-import-show-existing').checked;
+
+        if (!importItems || !importCount || LAST_SCANNED_JOBS.length === 0) return;
+
+        const filtered = LAST_SCANNED_JOBS.filter(job => {
+            const isExisting = CONFIG.jobs[job.key] !== undefined;
+            return showExisting ? true : !isExisting;
+        });
+
+        importCount.textContent = `(共 ${filtered.length} 个${showExisting ? '' : '，已过滤已配置'} )`;
+        importItems.innerHTML = '';
+
+        if (filtered.length === 0) {
+            importItems.innerHTML = '<div class="gm-empty-tip">没有符合条件的 Job。</div>';
+            return;
+        }
+
+        filtered.forEach(job => {
             const isExisting = CONFIG.jobs[job.key] !== undefined;
             const item = document.createElement('div');
             item.className = 'gm-import-item';
             item.innerHTML = `
-                <div class="gm-import-item-header">
-                    <span class="gm-import-item-name">${job.name}</span>
-                    ${job.available ?
-                        '<span class="gm-badge gm-badge-success">✓ 可用</span>' :
-                        '<span class="gm-badge gm-badge-warning">⚠ 状态未知</span>'
-                    }
-                    ${isExisting ?
-                        '<span class="gm-badge gm-badge-info">已配置</span>' :
-                        ''
-                    }
+                <div class="gm-import-item-row">
+                    <div class="gm-import-item-left">
+                        <span class="gm-import-item-name">${job.name}</span>
+                        ${job.available ?
+                            '<span class="gm-badge gm-badge-success">✓ 可用</span>' :
+                            '<span class="gm-badge gm-badge-warning">⚠ 状态未知</span>'
+                        }
+                        ${isExisting ? '<span class="gm-badge gm-badge-muted">已在配置</span>' : ''}
+                    </div>
+                    <div class="gm-import-item-right">
+                        ${isExisting ? `
+                            <button class="gm-btn-added" disabled>已在配置</button>
+                        ` : `
+                            <button class="gm-btn-add" data-job-key="${job.key}">
+                                ➕ 添加到配置
+                            </button>
+                        `}
+                    </div>
                 </div>
                 <div class="gm-import-item-info">
                     <small>Key: ${job.key} | Job: ${job.jobName}</small>
                 </div>
-                <div class="gm-import-item-actions">
-                    ${!isExisting ?
-                        `<button class="gm-btn-add" data-job-key="${job.key}">
-                            ➕ 添加到配置
-                        </button>` :
-                        `<button class="gm-btn-added" disabled>✓ 已添加</button>`
-                    }
-                </div>
             `;
             importItems.appendChild(item);
 
-            // 绑定添加按钮事件
-            if (!isExisting) {
-                const addBtn = item.querySelector('.gm-btn-add');
+            const addBtn = item.querySelector('.gm-btn-add');
+            if (addBtn) {
                 addBtn.onclick = () => addJobToConfig(job, addBtn);
             }
         });
@@ -465,10 +629,10 @@
         CONFIG.jobs[job.key] = {
             name: job.name,
             url: job.url,
-            enabled: true,
-            stage: 1,
+            enabled: false, // 导入时默认不启用，避免误触发
             wait: true
         };
+        syncDisplayOrder();
 
         // 更新按钮状态
         button.textContent = '✓ 已添加';
@@ -477,49 +641,13 @@
 
         // 刷新Job配置列表
         renderJobList();
+        rerenderImportList();
+        renderOrderList();
 
         console.log(`添加Job: ${job.name} (${job.key})`);
     }
 
-    /**
-     * 🆕 验证所有已配置的Job
-     */
-    async function validateJobs() {
-        const validateBtn = document.getElementById('gm-import-validate');
-        const originalText = validateBtn.textContent;
-        validateBtn.textContent = '⏳ 验证中...';
-        validateBtn.disabled = true;
-
-        try {
-            const results = await validateAllJobs();
-            const total = Object.keys(results).length;
-            const available = Object.values(results).filter(v => v).length;
-            const unavailable = total - available;
-
-            let message = `验证完成!\n\n`;
-            message += `总计: ${total} 个Job\n`;
-            message += `✅ 可用: ${available} 个\n`;
-            message += `❌ 不可用: ${unavailable} 个\n\n`;
-
-            if (unavailable > 0) {
-                message += '不可用的Job:\n';
-                for (const [key, exists] of Object.entries(results)) {
-                    if (!exists) {
-                        message += `- ${JOB_DEFINITIONS[key].name} (${key})\n`;
-                    }
-                }
-                message += '\n运行构建时将自动跳过这些项目。';
-            }
-
-            alert(message);
-        } catch (error) {
-            alert('验证失败: ' + error.message);
-            console.error('验证Job失败:', error);
-        } finally {
-            validateBtn.textContent = originalText;
-            validateBtn.disabled = false;
-        }
-    }
+    // 已添加列表标签被移除，若未来需要，可基于 getOrderedJobEntries 构建
 
     /**
      * 渲染Job配置列表
@@ -529,46 +657,104 @@
         if (!jobList) return;
 
         jobList.innerHTML = '';
-        for (const [key, job] of Object.entries(CONFIG.jobs)) {
+        for (const [key, job] of getOrderedJobEntries()) {
             const jobItem = document.createElement('div');
             jobItem.className = 'gm-job-item';
             jobItem.innerHTML = `
                 <div class="gm-job-header">
-                    <strong>${job.name}</strong>
-                    <label class="checkbox-label">
-                        <input type="checkbox" data-job-key="${key}" class="gm-job-enabled" ${job.enabled ? 'checked' : ''} />
-                        启用
-                    </label>
-                </div>
-                <div class="gm-config-field">
-                    <label>名称</label>
-                    <input type="text" data-job-key="${key}" class="gm-job-name" value="${job.name}" />
+                    <strong class="gm-job-name-display" data-job-key="${key}" title="双击编辑名称">${job.name}</strong>
+                    <div class="gm-job-switches">
+                        <label class="checkbox-label">
+                            <input type="checkbox" data-job-key="${key}" class="gm-job-wait" ${job.wait !== false ? 'checked' : ''} />
+                            优先
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" data-job-key="${key}" class="gm-job-enabled" ${job.enabled ? 'checked' : ''} />
+                            启用
+                        </label>
+                        <button class="gm-btn-remove gm-btn-remove-inline" data-job-key="${key}">🗑️</button>
+                    </div>
                 </div>
                 <div class="gm-config-field">
                     <label>构建 URL</label>
                     <input type="text" data-job-key="${key}" class="gm-job-url" value="${job.url}" />
                 </div>
-                <div class="gm-config-field">
-                    <label>构建阶段 (Stage)</label>
-                    <input type="number" data-job-key="${key}" class="gm-job-stage" value="${job.stage || 1}" min="1" />
-                    <small style="color: #6c757d;">数字越小越先执行，相同阶段的任务会并行执行</small>
-                </div>
-                <div class="gm-config-field">
-                    <label class="checkbox-label">
-                        <input type="checkbox" data-job-key="${key}" class="gm-job-wait" ${job.wait !== false ? 'checked' : ''} />
-                        等待构建完成 (阻塞后续阶段)
-                    </label>
-                </div>
-                <div class="gm-job-actions">
-                    <button class="gm-btn-remove" data-job-key="${key}">🗑️ 删除</button>
-                </div>
             `;
             jobList.appendChild(jobItem);
 
-            // 绑定删除按钮
-            const removeBtn = jobItem.querySelector('.gm-btn-remove');
-            removeBtn.onclick = () => removeJobFromConfig(key);
+            // 绑定删除按钮（放在启用右侧）
+            const removeBtn = jobItem.querySelector('.gm-btn-remove-inline');
+            let confirmTimer = null;
+            removeBtn.onclick = () => {
+                const isConfirm = removeBtn.getAttribute('data-confirm') === 'true';
+                if (!isConfirm) {
+                    removeBtn.setAttribute('data-confirm', 'true');
+                    removeBtn.classList.add('gm-btn-remove-confirm');
+                    removeBtn.textContent = '确认删除';
+                    if (confirmTimer) clearTimeout(confirmTimer);
+                    confirmTimer = setTimeout(() => {
+                        removeBtn.setAttribute('data-confirm', 'false');
+                        removeBtn.classList.remove('gm-btn-remove-confirm');
+                        removeBtn.textContent = '🗑️';
+                    }, 2000);
+                    return;
+                }
+                if (confirmTimer) clearTimeout(confirmTimer);
+                removeBtn.setAttribute('data-confirm', 'false');
+                removeBtn.classList.remove('gm-btn-remove-confirm');
+                removeBtn.textContent = '🗑️';
+                removeJobFromConfig(key);
+            };
+
+            // 名称双击编辑
+            const nameEl = jobItem.querySelector('.gm-job-name-display');
+            nameEl.ondblclick = () => {
+                const current = CONFIG.jobs[key]?.name || '';
+                const newName = prompt('编辑名称', current);
+                if (newName === null) return;
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    alert('名称不能为空');
+                    return;
+                }
+                CONFIG.jobs[key].name = trimmed;
+                nameEl.textContent = trimmed;
+                renderOrderList();
+            };
         }
+
+        renderOrderList();
+    }
+
+    /**
+     * 🆕 展示顺序列表（仅显示已启用的Job，可上下调整）
+     */
+    function renderOrderList() {
+        const listEl = document.getElementById('gm-order-list');
+        const countEl = document.getElementById('gm-order-count');
+        if (!listEl || !countEl) return;
+
+        const entries = getOrderedJobEntries().filter(([, job]) => job.enabled);
+        countEl.textContent = `(共 ${entries.length} 个启用项)`;
+
+        if (entries.length === 0) {
+            listEl.innerHTML = '<div class="gm-empty-tip">当前没有启用的 Job。</div>';
+            return;
+        }
+
+        listEl.innerHTML = '';
+        entries.forEach(([key, job], idx) => {
+            const item = document.createElement('div');
+            item.className = 'gm-order-item';
+            item.innerHTML = `
+                <div class="gm-order-name">${job.name}</div>
+                <div class="gm-order-btns">
+                    <button class="gm-order-up" data-key="${key}" ${idx === 0 ? 'disabled' : ''}>↑ 上移</button>
+                    <button class="gm-order-down" data-key="${key}" ${idx === entries.length - 1 ? 'disabled' : ''}>↓ 下移</button>
+                </div>
+            `;
+            listEl.appendChild(item);
+        });
     }
 
     /**
@@ -580,7 +766,11 @@
         const jobName = CONFIG.jobs[key].name;
         if (confirm(`确定要删除 "${jobName}" 吗？`)) {
             delete CONFIG.jobs[key];
+            CONFIG.displayOrder = CONFIG.displayOrder.filter(k => k !== key);
+            DISPLAY_ORDER = CONFIG.displayOrder;
             renderJobList();
+            rerenderImportList();
+            renderOrderList();
             console.log(`删除Job: ${jobName} (${key})`);
         }
     }
@@ -590,12 +780,16 @@
         const modal = document.getElementById('gm-config-modal');
         if (!overlay) return;
 
+        // 保证顺序与配置最新
+        syncDisplayOrder();
+
         // 加载当前配置到 UI
         document.getElementById('gm-cfg-maxRetries').value = CONFIG.triggerMaxRetries;
         document.getElementById('gm-cfg-retryDelay').value = CONFIG.triggerRetryDelay;
 
-        // 渲染Job列表
+        // 渲染Job列表和排序
         renderJobList();
+        renderOrderList();
 
         // 显示侧边栏（带动画效果）
         overlay.style.display = 'block';
@@ -636,9 +830,7 @@
         CONFIG.triggerRetryDelay = retryDelay;
 
         const enabledInputs = document.querySelectorAll('.gm-job-enabled');
-        const nameInputs = document.querySelectorAll('.gm-job-name');
         const urlInputs = document.querySelectorAll('.gm-job-url');
-        const stageInputs = document.querySelectorAll('.gm-job-stage');
         const waitInputs = document.querySelectorAll('.gm-job-wait');
 
         let hasError = false;
@@ -647,19 +839,6 @@
             const key = input.getAttribute('data-job-key');
             CONFIG.jobs[key].enabled = input.checked;
         });
-
-        nameInputs.forEach(input => {
-            const key = input.getAttribute('data-job-key');
-            const name = input.value.trim();
-            if (!name) {
-                alert(`❌ 验证失败：Job "${key}" 的名称不能为空`);
-                hasError = true;
-                return;
-            }
-            CONFIG.jobs[key].name = name;
-        });
-
-        if (hasError) return;
 
         urlInputs.forEach(input => {
             const key = input.getAttribute('data-job-key');
@@ -679,23 +858,28 @@
 
         if (hasError) return;
 
-        stageInputs.forEach(input => {
-            const key = input.getAttribute('data-job-key');
-            const stage = parseInt(input.value);
-            if (isNaN(stage) || stage < 1) {
-                alert(`❌ 验证失败：Job "${key}" 的构建阶段必须是大于0的整数`);
-                hasError = true;
-                return;
-            }
-            CONFIG.jobs[key].stage = stage;
-        });
-
-        if (hasError) return;
-
         waitInputs.forEach(input => {
             const key = input.getAttribute('data-job-key');
             CONFIG.jobs[key].wait = input.checked;
         });
+
+        // 名称校验（双击编辑后写入 CONFIG）
+        for (const [key, job] of Object.entries(CONFIG.jobs)) {
+            const name = (job.name || '').trim();
+            if (!name) {
+                alert(`❌ 验证失败：Job "${key}" 的名称不能为空`);
+                hasError = true;
+                break;
+            }
+            job.name = name;
+        }
+
+        if (hasError) return;
+
+        // 保存前统一规范化，避免布尔字段串型导致显示错误
+        CONFIG.jobs = sanitizeAllJobs(CONFIG.jobs);
+        syncDisplayOrder();
+        renderOrderList();
 
         if (saveConfig()) {
             alert('✅ 配置保存成功！');
@@ -827,24 +1011,40 @@
                 margin-bottom: 10px; border: 1px solid #dee2e6;
             }
             .gm-job-header {
-                display: flex; justify-content: space-between; align-items: center;
+                display: flex; justify-content: space-between; align-items: center; gap: 10px;
                 margin-bottom: 10px;
             }
             .gm-job-header strong { font-size: 14px; }
-            .gm-job-actions {
-                margin-top: 10px; text-align: right;
+            .gm-job-switches {
+                display: flex; align-items: center; gap: 10px;
             }
+            .gm-job-name-display { cursor: pointer; user-select: none; }
             .gm-btn-remove {
-                padding: 5px 12px; background: #dc3545; color: white;
+                padding: 5px 12px; background: #6c757d; color: white;
                 border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
+                transition: background .2s ease;
             }
-            .gm-btn-remove:hover { background: #c82333; }
+            .gm-btn-remove:hover { background: #5a6268; }
+            .gm-btn-remove-inline {
+                padding: 4px 10px;
+                margin-left: 4px;
+            }
+            .gm-btn-remove-confirm {
+                background: #dc3545 !important;
+            }
 
             /* 🆕 导入功能样式 */
             .gm-action-btn {
                 padding: 8px 16px; border: none; border-radius: 4px;
                 cursor: pointer; font-size: 13px; margin-right: 10px;
                 font-weight: 500;
+            }
+            .gm-import-toggle {
+                margin-left: 6px; font-size: 12px; color: #555;
+                user-select: none; cursor: pointer;
+            }
+            .gm-import-toggle input {
+                vertical-align: middle; margin-right: 4px;
             }
             .gm-btn-scan {
                 background: #17a2b8; color: white;
@@ -854,10 +1054,25 @@
                 background: #28a745; color: white;
             }
             .gm-btn-validate:hover { background: #218838; }
+            .gm-btn-export {
+                background: #6f42c1; color: white;
+            }
+            .gm-btn-export:hover { background: #5a379e; }
+            .gm-btn-import {
+                background: #20c997; color: white;
+            }
+            .gm-btn-import:hover { background: #17a589; }
             .gm-import-item {
                 background: white; padding: 12px; border-radius: 4px;
                 margin-bottom: 8px; border: 1px solid #dee2e6;
             }
+            .gm-import-item-row {
+                display: flex; align-items: center; gap: 10px;
+            }
+            .gm-import-item-left {
+                display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+            }
+            .gm-import-item-right { margin-left: auto; }
             .gm-import-item-header {
                 display: flex; align-items: center; gap: 8px;
                 margin-bottom: 5px;
@@ -896,6 +1111,19 @@
                 padding: 5px 12px; background: #6c757d; color: white;
                 border: none; border-radius: 4px; cursor: not-allowed; font-size: 12px;
             }
+            .gm-order-list .gm-order-item {
+                display: flex; align-items: center; gap: 10px;
+                padding: 10px 12px; border: 1px solid #dee2e6;
+                border-radius: 4px; background: #fff; margin-bottom: 8px;
+            }
+            .gm-order-name { flex: 1; font-weight: 500; }
+            .gm-order-btns button {
+                padding: 4px 10px; border: 1px solid #ced4da;
+                background: #f8f9fa; cursor: pointer; border-radius: 4px;
+                margin-left: 4px; font-size: 12px;
+            }
+            .gm-order-btns button:hover { background: #e2e6ea; }
+            .gm-order-hint { color: #6c757d; font-size: 12px; margin-top: 6px; }
 
             /* 🆕 标签导航样式 */
             .gm-settings-nav {
@@ -999,7 +1227,7 @@
         if (!stepContainer) return;
         stepContainer.innerHTML = '';
         stepContainer.style.display = 'block';
-        for (const [key, jobData] of Object.entries(JOB_DEFINITIONS)) {
+        for (const [key, jobData] of getOrderedJobEntries()) {
             const el = document.createElement('div');
             el.id = `gm-step-${key}`;
             el.style = 'padding: 5px 8px; border-bottom: 1px solid #eee;';
@@ -1050,19 +1278,11 @@
     // --- Jenkins API 核心函数 ---
 
     /**
-     * 🆕 触发单个构建 (增强版 - 支持Job存在性检测)
+     * 🆕 触发单个构建
      */
     async function triggerSingleBuild(jobKey, crumb) {
         const jobData = JOB_DEFINITIONS[jobKey];
         if (!jobData) throw new BuildChainError(`Job key "${jobKey}" 未在 JOB_DEFINITIONS 中定义。`);
-
-        // 🆕 先检查Job是否存在
-        const exists = await checkJobExists(jobData.url);
-        if (!exists) {
-            updateStepStatus(jobKey, '❌ Job不存在,已跳过', '⏭️', 'skipped');
-            console.warn(`[${jobData.name}] Job不存在或无法访问，已跳过`);
-            throw new BuildChainError(`[${jobData.name}] Job不存在`);
-        }
 
         updateStepStatus(jobKey, '正在请求...', '⏳', 'warning');
 
@@ -1187,6 +1407,11 @@
      * 启动联合构建链 (🆕 增强版 - 支持自动跳过不存在的Job)
      */
     async function startCombinedChain() {
+        // 运行前统一清洗配置，确保 wait/enable 状态与 UI 一致
+        CONFIG.jobs = sanitizeAllJobs(CONFIG.jobs);
+        syncDisplayOrder();
+        JOB_DEFINITIONS = CONFIG.jobs;
+
         isBuildCancelled = false;
         const crumb = getMyJenkinsCrumb();
         if (!crumb) {
