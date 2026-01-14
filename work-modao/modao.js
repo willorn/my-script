@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      0.2
 // @description  Force Modao preview zoom to 80% and keep it there
-// @match        *://*/*
+// @match        https://modao.cc/*
 // @grant        none
 // @run-at       document-end
 // ==/UserScript==
